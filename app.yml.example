@@ -1,0 +1,31 @@
+gdd:
+  db:
+    disable-autoconfigure: true
+  manage:
+    enable: true
+
+canal:
+  source:
+    addr: "127.0.0.1:3306"
+    user: "root"
+    pass: "1234"
+    include-table-regex: "my_database\\..*"
+  db:
+    name: pg_database
+    driver: postgres
+    dsn: host=127.0.0.1 user=postgres password=1234 dbname=pg_database port=5432 sslmode=disable TimeZone=Asia/Shanghai
+    table:
+      prefix: "pg_schema"
+    log:
+      level: info
+      slow-threshold: 200ms
+      ignore-record-not-found-error: false
+      parameterized-queries: false
+    postgres:
+      prefer-simple-protocol: false
+      without-returning: false
+    pool:
+      max-idle-conns: 2
+      max-open-conns: -1
+      conn-max-lifetime: ""
+      conn-max-idle-time: ""
