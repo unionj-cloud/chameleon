@@ -6,10 +6,12 @@ package plugin
 
 import (
 	"github.com/go-mysql-org/go-mysql/canal"
+	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/unionj-cloud/chameleon/config"
 	"github.com/unionj-cloud/chameleon/internal/handlers"
 	"github.com/unionj-cloud/go-doudou/v2/toolkit/zlogger"
 	"os"
+	"regexp"
 
 	"github.com/unionj-cloud/go-doudou/v2/framework/grpcx"
 	"github.com/unionj-cloud/go-doudou/v2/framework/plugin"
@@ -44,9 +46,7 @@ func (receiver *CanalPlugin) Initialize(_ *rest.RestServer, _ *grpcx.GrpcServer,
 	cfg.Addr = conf.Source.Addr
 	cfg.User = conf.Source.User
 	cfg.Password = conf.Source.Pass
-	// We only care table canal_test in test db
-	//cfg.Dump.TableDB = "xxx"
-	//cfg.Dump.Tables = []string{"xxx"}
+	cfg.Dump.Databases = []string{conf.Source.Database}
 	cfg.IncludeTableRegex = conf.Source.IncludeTableRegex
 
 	c, err := canal.NewCanal(cfg)
@@ -54,20 +54,42 @@ func (receiver *CanalPlugin) Initialize(_ *rest.RestServer, _ *grpcx.GrpcServer,
 		zlogger.Fatal().Msg(err.Error())
 	}
 
-	eventHandler := handlers.NewVastbaseEventHandler(conf, c)
-	// Register a handler to handle RowsEvent
-	c.SetEventHandler(eventHandler)
-
-	pos, err := c.GetMasterPos()
+	conn, err := client.Connect(conf.Source.Addr, conf.Source.User, conf.Source.Pass, conf.Source.Database)
 	if err != nil {
 		zlogger.Fatal().Msg(err.Error())
 	}
 
+	var regs []*regexp.Regexp
+	for _, item := range conf.Source.IncludeTableRegex {
+		reg, err := regexp.Compile(item)
+		if err != nil {
+			zlogger.Fatal().Msg(err.Error())
+		}
+		regs = append(regs, reg)
+	}
+
+	eventHandler := handlers.NewVastbaseEventHandler(conf, c, conn, regs)
+	if err = eventHandler.Migrate(); err != nil {
+		zlogger.Fatal().Msg(err.Error())
+	}
+	// Register a handler to handle RowsEvent
+	c.SetEventHandler(eventHandler)
+
 	// Start canal
 	// 设置了同步起始位置则跳过dump，直接做增量同步
 	go func() {
-		if err := c.RunFrom(pos); err != nil {
-			panic(err)
+		if conf.Source.Migrate {
+			if err := c.Run(); err != nil {
+				panic(err)
+			}
+		} else {
+			pos, err := c.GetMasterPos()
+			if err != nil {
+				zlogger.Fatal().Msg(err.Error())
+			}
+			if err := c.RunFrom(pos); err != nil {
+				panic(err)
+			}
 		}
 	}()
 }

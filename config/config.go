@@ -16,6 +16,9 @@ type Config struct {
 		User              string
 		Pass              string
 		IncludeTableRegex []string
+		Migrate           bool
+		Database          string
+		Copy              bool
 	}
 	config.Config
 }
