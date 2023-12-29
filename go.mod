@@ -183,4 +183,4 @@ require (
 	gorm.io/plugin/prometheus v0.1.0 // indirect
 )
 
-//replace github.com/unionj-cloud/go-doudou/v2 v2.2.2 => /Users/wubin1989/workspace/cloud/go-doudou
+replace github.com/unionj-cloud/go-doudou/v2 v2.2.3 => /Users/wubin1989/workspace/cloud/go-doudou

@@ -309,7 +309,9 @@ func (ta *Table) fetchColumns(conn mysql.Executer) error {
 			value = strings.ReplaceAll(value, `"`, "")
 			value = strings.ReplaceAll(value, "'", "")
 			value = strings.ReplaceAll(value, "`", "")
-			defaultVal = &value
+			if !strings.Contains(value, "(") && !strings.Contains(value, "current_") {
+				defaultVal = &value
+			}
 		}
 		ta.AddColumn(name, colType, collation, extra, colNull, defaultVal, comment)
 	}

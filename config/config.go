@@ -16,9 +16,11 @@ type Config struct {
 		User              string
 		Pass              string
 		IncludeTableRegex []string
+		ExcludeTableRegex []string
 		Migrate           bool
 		Database          string
-		Copy              bool
+		Dump              bool
+		Sync              bool
 	}
 	config.Config
 }

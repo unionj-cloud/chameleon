@@ -5,6 +5,7 @@
 package plugin
 
 import (
+	"context"
 	"github.com/go-mysql-org/go-mysql/canal"
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/unionj-cloud/chameleon/config"
@@ -48,6 +49,7 @@ func (receiver *CanalPlugin) Initialize(_ *rest.RestServer, _ *grpcx.GrpcServer,
 	cfg.Password = conf.Source.Pass
 	cfg.Dump.Databases = []string{conf.Source.Database}
 	cfg.IncludeTableRegex = conf.Source.IncludeTableRegex
+	cfg.ExcludeTableRegex = conf.Source.ExcludeTableRegex
 
 	c, err := canal.NewCanal(cfg)
 	if err != nil {
@@ -68,30 +70,44 @@ func (receiver *CanalPlugin) Initialize(_ *rest.RestServer, _ *grpcx.GrpcServer,
 		regs = append(regs, reg)
 	}
 
-	eventHandler := handlers.NewVastbaseEventHandler(conf, c, conn, regs)
-	if err = eventHandler.Migrate(); err != nil {
-		zlogger.Fatal().Msg(err.Error())
+	hooks := handlers.Hooks{}
+	eventHandler := handlers.NewVastbaseEventHandler(conf, c, conn, regs, &hooks)
+	if conf.Source.Migrate {
+		if err = eventHandler.Migrate(); err != nil {
+			zlogger.Fatal().Msg(err.Error())
+		}
 	}
 	// Register a handler to handle RowsEvent
 	c.SetEventHandler(eventHandler)
 
-	// Start canal
-	// 设置了同步起始位置则跳过dump，直接做增量同步
-	go func() {
-		if conf.Source.Migrate {
-			if err := c.Run(); err != nil {
-				panic(err)
-			}
-		} else {
-			pos, err := c.GetMasterPos()
-			if err != nil {
+	if conf.Source.Dump {
+		if err = c.Dump(); err != nil {
+			zlogger.Fatal().Msg(err.Error())
+		}
+		if hooks.AfterDumpHook != nil {
+			if err = hooks.AfterDumpHook(context.Background()); err != nil {
 				zlogger.Fatal().Msg(err.Error())
 			}
-			if err := c.RunFrom(pos); err != nil {
-				panic(err)
-			}
 		}
-	}()
+	}
+
+	if conf.Source.Sync {
+		go func() {
+			if conf.Source.Dump {
+				if err := c.Run(); err != nil {
+					panic(err)
+				}
+			} else {
+				pos, err := c.GetMasterPos()
+				if err != nil {
+					zlogger.Fatal().Msg(err.Error())
+				}
+				if err := c.RunFrom(pos); err != nil {
+					panic(err)
+				}
+			}
+		}()
+	}
 }
 
 func init() {

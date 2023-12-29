@@ -41,7 +41,7 @@ func TestVastbaseEventHandler_Migrate(t *testing.T) {
 		}
 		regs = append(regs, reg)
 	}
-	eventHandler := handlers.NewVastbaseEventHandler(conf, nil, conn, regs)
+	eventHandler := handlers.NewVastbaseEventHandler(conf, nil, conn, regs, &handlers.Hooks{})
 	if err := eventHandler.Migrate(); err != nil {
 		panic(err)
 	}

@@ -34,17 +34,52 @@ type VastbaseEventHandler struct {
 	canal    *canal.Canal
 	sourceDB *client.Conn
 	regs     []*regexp.Regexp
+	hooks    *Hooks
 }
 
-func NewVastbaseEventHandler(conf *config.Config, canal *canal.Canal, sourceDB *client.Conn, regs []*regexp.Regexp) *VastbaseEventHandler {
+func NewVastbaseEventHandler(conf *config.Config, canal *canal.Canal, sourceDB *client.Conn, regs []*regexp.Regexp, hooks *Hooks) *VastbaseEventHandler {
+	targetDB := database.NewDb(conf.Config)
+	if hooks != nil && hooks.AfterDumpHook == nil && !conf.Source.Sync {
+		hooks.AfterDumpHook = func(ctx context.Context) error {
+			if err := targetDB.WithContext(ctx).Exec(fmt.Sprintf(`set search_path = "%s";
+CREATE OR REPLACE FUNCTION "reset_sequence" (tablename text, columnname text, sequence_name text) 
+    RETURNS INTEGER AS 
+    
+    $body$  
+      DECLARE 
+      retval  INTEGER;
+      BEGIN 
+    
+      EXECUTE 'SELECT setval( ''' || sequence_name  || ''', ' || '(SELECT MAX(' || columnname || 
+          ') FROM "' || tablename || '")' || '+1)' INTO retval;
+      RETURN retval;
+      END;  
+    
+    $body$  LANGUAGE 'plpgsql';`, conf.Db.Table.Prefix)).Error; err != nil {
+				return errors.WithStack(err)
+			}
+			if err := targetDB.WithContext(ctx).Exec(`SELECT table_name || '_' || column_name || '_seq', 
+    reset_sequence(table_name, column_name, table_name || '_' || column_name || '_seq') 
+FROM information_schema.columns where columns.table_schema = $1 and columns.column_default like 'nextval%';
+`, conf.Db.Table.Prefix).Error; err != nil {
+				return errors.WithStack(err)
+			}
+			return nil
+		}
+	}
 	return &VastbaseEventHandler{
 		vendor:   dbvendor.Registry.GetVendor(conf.Db.Driver),
-		targetDB: database.NewDb(conf.Config),
+		targetDB: targetDB,
 		conf:     conf,
 		canal:    canal,
 		sourceDB: sourceDB,
 		regs:     regs,
+		hooks:    hooks,
 	}
+}
+
+func (h *VastbaseEventHandler) GetTargetDB() *gorm.DB {
+	return h.targetDB
 }
 
 func (h *VastbaseEventHandler) fetchExistTable(conn *client.Conn) ([]string, error) {
@@ -69,9 +104,6 @@ func (h *VastbaseEventHandler) fetchExistTable(conn *client.Conn) ([]string, err
 }
 
 func (h *VastbaseEventHandler) Migrate() error {
-	if !h.conf.Source.Migrate {
-		return nil
-	}
 	existTables, err := h.fetchExistTable(h.sourceDB)
 	if err != nil {
 		return errors.WithStack(err)
@@ -85,7 +117,7 @@ func (h *VastbaseEventHandler) Migrate() error {
 				break
 			}
 		}
-		if !match {
+		if len(h.regs) > 0 && !match {
 			continue
 		}
 		sourceTable, err := schema.NewTable(h.sourceDB, database, table)
@@ -99,6 +131,11 @@ func (h *VastbaseEventHandler) Migrate() error {
 		if err = h.vendor.CreateTable(context.Background(), h.targetDB, targetTable); err != nil {
 			return errors.WithStack(err)
 		}
+		if h.hooks != nil && h.hooks.AfterCreateTableHook != nil {
+			if err = h.hooks.AfterCreateTableHook(context.Background(), h.targetDB, targetTable); err != nil {
+				return errors.WithStack(err)
+			}
+		}
 	}
 	return nil
 }
@@ -106,7 +143,6 @@ func (h *VastbaseEventHandler) Migrate() error {
 func (h *VastbaseEventHandler) ConvertSourceTable2TargetTable(source *schema.Table, target *dbvendor.Table) error {
 	target.Name = strings.ToLower(source.Name)
 	target.TablePrefix = h.conf.Db.Table.Prefix
-	target.IsCopy = h.conf.Source.Copy
 	if len(source.PKColumns) == 0 {
 		return errors.WithStack(errors.Errorf("Source table %s should have at least one primary key", source.Name))
 	}
@@ -398,12 +434,13 @@ func (h *VastbaseEventHandler) OnRow(e *canal.RowsEvent) error {
 	if stringutils.IsEmpty(tablePrefix) {
 		tablePrefix = h.conf.Db.Name
 	}
+	pkCol := e.Table.GetPKColumn(0)
 	dml := dbvendor.DMLSchema{
 		Schema:      h.conf.Db.Name,
 		TablePrefix: tablePrefix,
 		TableName:   tableName,
 		Pk: dbvendor.Column{
-			Name: "id",
+			Name: pkCol.Name,
 		},
 	}
 	switch e.Action {
