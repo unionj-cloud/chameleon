@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"github.com/go-mysql-org/go-mysql/canal"
 	"github.com/go-mysql-org/go-mysql/client"
@@ -9,6 +10,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/pkg/errors"
 	"github.com/siddontang/go-log/log"
+	"github.com/unionj-cloud/chameleon"
 	"github.com/unionj-cloud/chameleon/config"
 	"github.com/unionj-cloud/chameleon/internal/schema"
 	"github.com/unionj-cloud/go-doudou/v2/framework/database"
@@ -21,27 +23,79 @@ import (
 	"github.com/unionj-cloud/go-doudou/v2/toolkit/stringutils"
 	"github.com/unionj-cloud/go-doudou/v2/toolkit/zlogger"
 	"gorm.io/gorm"
+	"math"
 	"regexp"
 	"strings"
+	"sync"
 )
 
-var _ canal.EventHandler = (*VastbaseEventHandler)(nil)
+var _ chameleon.IEventHandler = (*VastbaseEventHandler)(nil)
 
-type VastbaseEventHandler struct {
-	conf     *config.Config
-	vendor   dbvendor.IVendor
-	targetDB *gorm.DB
-	canal    *canal.Canal
-	sourceDB *client.Conn
-	regs     []*regexp.Regexp
-	hooks    *Hooks
+type DumpTask struct {
+	Dml  dbvendor.DMLSchema
+	Args []interface{}
 }
 
-func NewVastbaseEventHandler(conf *config.Config, canal *canal.Canal, sourceDB *client.Conn, regs []*regexp.Regexp, hooks *Hooks) *VastbaseEventHandler {
+type VastbaseEventHandler struct {
+	conf      *config.Config
+	vendor    dbvendor.IVendor
+	targetDB  *gorm.DB
+	sourceDB  *client.Conn
+	regs      []*regexp.Regexp
+	dumping   bool
+	dumpTasks []*DumpTask
+	taskPool  sync.Pool
+}
+
+func (h *VastbaseEventHandler) Close() {
+	if h.targetDB != nil {
+		sqlDB, _ := h.targetDB.DB()
+		if sqlDB != nil {
+			sqlDB.Close()
+		}
+	}
+	if h.sourceDB != nil {
+		h.sourceDB.Close()
+	}
+}
+
+func init() {
+	conf := config.G_Config
+	conn, err := client.Connect(conf.Source.Addr, conf.Source.User, conf.Source.Pass, conf.Source.Database)
+	if err != nil {
+		zlogger.Panic().Msg(err.Error())
+	}
+	var regs []*regexp.Regexp
+	for _, item := range conf.Source.IncludeTableRegex {
+		reg, err := regexp.Compile(item)
+		if err != nil {
+			zlogger.Panic().Msg(err.Error())
+		}
+		regs = append(regs, reg)
+	}
 	targetDB := database.NewDb(conf.Config)
-	if hooks != nil && hooks.AfterDumpHook == nil && !conf.Source.Sync {
-		hooks.AfterDumpHook = func(ctx context.Context) error {
-			if err := targetDB.WithContext(ctx).Exec(fmt.Sprintf(`set search_path = "%s";
+	eventHandler := &VastbaseEventHandler{
+		vendor:    dbvendor.Registry.GetVendor(conf.Db.Driver),
+		targetDB:  targetDB,
+		conf:      conf,
+		sourceDB:  conn,
+		regs:      regs,
+		dumpTasks: make([]*DumpTask, 0, conf.Source.DumpBatchSize),
+		taskPool: sync.Pool{
+			New: func() any {
+				return new(DumpTask)
+			},
+		},
+	}
+	if conf.Source.Dump {
+		eventHandler.dumping = true
+		go func() {
+			<-chameleon.GetCanal().WaitDumpDone()
+			eventHandler.batchInsert()
+			eventHandler.dumping = false
+
+			if !conf.Source.Sync {
+				if err := eventHandler.targetDB.WithContext(context.Background()).Exec(fmt.Sprintf(`set search_path = "%s";
 CREATE OR REPLACE FUNCTION "reset_sequence" (tablename text, columnname text, sequence_name text) 
     RETURNS INTEGER AS 
     
@@ -56,30 +110,87 @@ CREATE OR REPLACE FUNCTION "reset_sequence" (tablename text, columnname text, se
       END;  
     
     $body$  LANGUAGE 'plpgsql';`, conf.Db.Table.Prefix)).Error; err != nil {
-				return errors.WithStack(err)
-			}
-			if err := targetDB.WithContext(ctx).Exec(`SELECT table_name || '_' || column_name || '_seq', 
+					zlogger.Panic().Msg(err.Error())
+				}
+				if err := eventHandler.targetDB.WithContext(context.Background()).Exec(`SELECT table_name || '_' || column_name || '_seq', 
     reset_sequence(table_name, column_name, table_name || '_' || column_name || '_seq') 
 FROM information_schema.columns where columns.table_schema = $1 and columns.column_default like 'nextval%';
 `, conf.Db.Table.Prefix).Error; err != nil {
-				return errors.WithStack(err)
+					zlogger.Panic().Msg(err.Error())
+				}
 			}
-			return nil
-		}
+		}()
 	}
-	return &VastbaseEventHandler{
-		vendor:   dbvendor.Registry.GetVendor(conf.Db.Driver),
-		targetDB: targetDB,
-		conf:     conf,
-		canal:    canal,
-		sourceDB: sourceDB,
-		regs:     regs,
-		hooks:    hooks,
+	chameleon.RegisterHandler(eventHandler)
+}
+
+const (
+	maxParameterSize = 65535
+)
+
+type DMLKey struct {
+	Schema      string
+	TablePrefix string
+	TableName   string
+}
+
+func (h *VastbaseEventHandler) doBatchInsert(db *sql.DB, dml dbvendor.DMLSchema, rows []interface{}, args []interface{}) {
+	statement, err := h.vendor.GetBatchInsertStatement(dml, rows)
+	if err != nil {
+		zlogger.Panic().Err(errors.WithStack(err)).Msg(err.Error())
+	}
+	if _, err = db.ExecContext(context.Background(), statement, args...); err != nil {
+		zlogger.Panic().Err(errors.WithStack(err)).Msg(err.Error())
 	}
 }
 
-func (h *VastbaseEventHandler) GetTargetDB() *gorm.DB {
-	return h.targetDB
+func (h *VastbaseEventHandler) batchInsert() {
+	if len(h.dumpTasks) == 0 {
+		return
+	}
+	defer func() {
+		zlogger.Info().Msgf("%d rows dumped", len(h.dumpTasks))
+		for _, item := range h.dumpTasks {
+			h.taskPool.Put(item)
+		}
+		h.dumpTasks = h.dumpTasks[:0]
+	}()
+
+	dmlMap := make(map[DMLKey][]*DumpTask)
+	for _, item := range h.dumpTasks {
+		key := DMLKey{
+			Schema:      item.Dml.Schema,
+			TablePrefix: item.Dml.TablePrefix,
+			TableName:   item.Dml.TableName,
+		}
+		dmlMap[key] = append(dmlMap[key], item)
+	}
+
+	sqlDB, err := h.targetDB.DB()
+	if err != nil {
+		zlogger.Panic().Msg(err.Error())
+	}
+
+	var args []interface{}
+	var rows []interface{}
+	for _, v := range dmlMap {
+		parameterSizePerRow := float64(len(v[0].Args))
+		maxRowSize := math.Floor(maxParameterSize / parameterSizePerRow)
+		for _, item := range v {
+			args = append(args, item.Args...)
+			rows = append(rows, item)
+			if len(rows) == int(maxRowSize) {
+				h.doBatchInsert(sqlDB, v[0].Dml, rows, args)
+				args = args[:0]
+				rows = rows[:0]
+			}
+		}
+		h.doBatchInsert(sqlDB, v[0].Dml, rows, args)
+		args = args[:0]
+		rows = rows[:0]
+	}
+	args = nil
+	rows = nil
 }
 
 func (h *VastbaseEventHandler) fetchExistTable(conn *client.Conn) ([]string, error) {
@@ -131,11 +242,6 @@ func (h *VastbaseEventHandler) Migrate() error {
 		if err = h.vendor.CreateTable(context.Background(), h.targetDB, targetTable); err != nil {
 			return errors.WithStack(err)
 		}
-		if h.hooks != nil && h.hooks.AfterCreateTableHook != nil {
-			if err = h.hooks.AfterCreateTableHook(context.Background(), h.targetDB, targetTable); err != nil {
-				return errors.WithStack(err)
-			}
-		}
 	}
 	return nil
 }
@@ -178,9 +284,9 @@ func (h *VastbaseEventHandler) OnRotate(header *replication.EventHeader, rotateE
 }
 
 func (h *VastbaseEventHandler) OnTableChanged(header *replication.EventHeader, schema string, table string) error {
-	log.Infof("===================== OnTableChanged called =====================")
-	h.canal.ClearTableCache([]byte(schema), []byte(table))
-	h.canal.ClearTableCache([]byte(schema), []byte(strings.ToLower(table)))
+	log.Debugf("===================== OnTableChanged called =====================")
+	chameleon.GetCanal().ClearTableCache([]byte(schema), []byte(table))
+	chameleon.GetCanal().ClearTableCache([]byte(schema), []byte(strings.ToLower(table)))
 	return nil
 }
 
@@ -322,7 +428,7 @@ func (h *VastbaseEventHandler) ConvertColType2ColumnType(colType int) (vbType st
 }
 
 func (h *VastbaseEventHandler) OnDDL(header *replication.EventHeader, nextPos mysql.Position, queryEvent *replication.QueryEvent) error {
-	log.Infof("===================== OnDDL called =====================")
+	log.Debugf("===================== OnDDL called =====================")
 	p := parser.NewParser(parser.WithDebugMode(true))
 	ret, err := p.ParseDDL(string(queryEvent.Query))
 	if err != nil {
@@ -428,7 +534,7 @@ func (h *VastbaseEventHandler) OnPosSynced(header *replication.EventHeader, pos 
 }
 
 func (h *VastbaseEventHandler) OnRow(e *canal.RowsEvent) error {
-	log.Infof("%s %v\n", e.Action, e.Rows)
+	log.Debugf("%s %v\n", e.Action, e.Rows)
 	tableName := e.Table.Name
 	tablePrefix := h.conf.Db.Table.Prefix
 	if stringutils.IsEmpty(tablePrefix) {
@@ -452,20 +558,31 @@ func (h *VastbaseEventHandler) OnRow(e *canal.RowsEvent) error {
 				Name:  strings.ToLower(v.Name),
 			})
 		}
-		statement, err := h.vendor.GetInsertStatement(dml)
-		if err != nil {
-			zlogger.Err(errors.WithStack(err)).Msg(err.Error())
-			return nil
-		}
 		sqlDB, err := h.targetDB.DB()
 		if err != nil {
-			zlogger.Err(errors.WithStack(err)).Msg(err.Error())
-			return nil
+			zlogger.Panic().Msg(err.Error())
 		}
-		for _, row := range e.Rows {
-			if _, err = sqlDB.ExecContext(context.Background(), statement, row...); err != nil {
+		if h.dumping {
+			for _, row := range e.Rows {
+				task := h.taskPool.Get().(*DumpTask)
+				task.Dml = dml
+				task.Args = row
+				h.dumpTasks = append(h.dumpTasks, task)
+				if len(h.dumpTasks) == h.conf.Source.DumpBatchSize {
+					h.batchInsert()
+				}
+			}
+		} else {
+			statement, err := h.vendor.GetInsertStatement(dml)
+			if err != nil {
 				zlogger.Err(errors.WithStack(err)).Msg(err.Error())
 				return nil
+			}
+			for _, row := range e.Rows {
+				if _, err = sqlDB.ExecContext(context.Background(), statement, row...); err != nil {
+					zlogger.Err(errors.WithStack(err)).Msg(err.Error())
+					return nil
+				}
 			}
 		}
 	case canal.UpdateAction:
@@ -483,8 +600,7 @@ func (h *VastbaseEventHandler) OnRow(e *canal.RowsEvent) error {
 		}
 		sqlDB, err := h.targetDB.DB()
 		if err != nil {
-			zlogger.Err(errors.WithStack(err)).Msg(err.Error())
-			return nil
+			zlogger.Panic().Msg(err.Error())
 		}
 		if len(e.Rows) < 2 {
 			return nil
@@ -521,5 +637,5 @@ func (h *VastbaseEventHandler) OnRow(e *canal.RowsEvent) error {
 }
 
 func (h *VastbaseEventHandler) String() string {
-	return "VastbaseEventHandler"
+	return "vastbase"
 }

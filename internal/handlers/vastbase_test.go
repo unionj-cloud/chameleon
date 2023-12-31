@@ -1,10 +1,9 @@
-package handlers_test
+package handlers
 
 import (
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/integralist/go-findroot/find"
 	"github.com/unionj-cloud/chameleon/config"
-	"github.com/unionj-cloud/chameleon/internal/handlers"
 	"github.com/unionj-cloud/go-doudou/v2/toolkit/yaml"
 	"github.com/unionj-cloud/go-doudou/v2/toolkit/zlogger"
 	"path/filepath"
@@ -41,7 +40,7 @@ func TestVastbaseEventHandler_Migrate(t *testing.T) {
 		}
 		regs = append(regs, reg)
 	}
-	eventHandler := handlers.NewVastbaseEventHandler(conf, nil, conn, regs, &handlers.Hooks{})
+	eventHandler := newVastbaseEventHandler(conf, nil, conn, regs)
 	if err := eventHandler.Migrate(); err != nil {
 		panic(err)
 	}

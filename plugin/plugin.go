@@ -5,20 +5,16 @@
 package plugin
 
 import (
-	"context"
-	"github.com/go-mysql-org/go-mysql/canal"
-	"github.com/go-mysql-org/go-mysql/client"
+	"github.com/unionj-cloud/chameleon"
 	"github.com/unionj-cloud/chameleon/config"
-	"github.com/unionj-cloud/chameleon/internal/handlers"
-	"github.com/unionj-cloud/go-doudou/v2/toolkit/zlogger"
-	"os"
-	"regexp"
-
+	_ "github.com/unionj-cloud/chameleon/internal/handlers"
 	"github.com/unionj-cloud/go-doudou/v2/framework/grpcx"
 	"github.com/unionj-cloud/go-doudou/v2/framework/plugin"
 	"github.com/unionj-cloud/go-doudou/v2/framework/rest"
 	"github.com/unionj-cloud/go-doudou/v2/toolkit/pipeconn"
 	"github.com/unionj-cloud/go-doudou/v2/toolkit/stringutils"
+	"github.com/unionj-cloud/go-doudou/v2/toolkit/zlogger"
+	"os"
 )
 
 var _ plugin.ServicePlugin = (*CanalPlugin)(nil)
@@ -27,6 +23,7 @@ type CanalPlugin struct {
 }
 
 func (receiver *CanalPlugin) Close() {
+	chameleon.Close()
 }
 
 func (receiver *CanalPlugin) GoDoudouServicePlugin() {
@@ -42,68 +39,51 @@ func (receiver *CanalPlugin) GetName() string {
 }
 
 func (receiver *CanalPlugin) Initialize(_ *rest.RestServer, _ *grpcx.GrpcServer, _ pipeconn.DialContextFunc) {
-	conf := config.LoadFromEnv()
-	cfg := canal.NewDefaultConfig()
-	cfg.Addr = conf.Source.Addr
-	cfg.User = conf.Source.User
-	cfg.Password = conf.Source.Pass
-	cfg.Dump.Databases = []string{conf.Source.Database}
-	cfg.IncludeTableRegex = conf.Source.IncludeTableRegex
-	cfg.ExcludeTableRegex = conf.Source.ExcludeTableRegex
-
-	c, err := canal.NewCanal(cfg)
-	if err != nil {
-		zlogger.Fatal().Msg(err.Error())
-	}
-
-	conn, err := client.Connect(conf.Source.Addr, conf.Source.User, conf.Source.Pass, conf.Source.Database)
-	if err != nil {
-		zlogger.Fatal().Msg(err.Error())
-	}
-
-	var regs []*regexp.Regexp
-	for _, item := range conf.Source.IncludeTableRegex {
-		reg, err := regexp.Compile(item)
-		if err != nil {
-			zlogger.Fatal().Msg(err.Error())
+	defer func() {
+		if r := recover(); r != nil {
+			zlogger.Info().Msgf("Recovered. Error:\n", r)
+			receiver.Close()
 		}
-		regs = append(regs, reg)
+	}()
+	conf := config.G_Config
+	eventHandler, ok := chameleon.GetHandlerRegistry()[conf.Source.Handler]
+	if !ok {
+		zlogger.Panic().Msgf("Handler %s not found", conf.Source.Handler)
 	}
-
-	hooks := handlers.Hooks{}
-	eventHandler := handlers.NewVastbaseEventHandler(conf, c, conn, regs, &hooks)
 	if conf.Source.Migrate {
-		if err = eventHandler.Migrate(); err != nil {
-			zlogger.Fatal().Msg(err.Error())
+		if err := eventHandler.Migrate(); err != nil {
+			zlogger.Panic().Msg(err.Error())
 		}
 	}
+
 	// Register a handler to handle RowsEvent
-	c.SetEventHandler(eventHandler)
+	chameleon.GetCanal().SetEventHandler(eventHandler)
 
 	if conf.Source.Dump {
-		if err = c.Dump(); err != nil {
-			zlogger.Fatal().Msg(err.Error())
-		}
-		if hooks.AfterDumpHook != nil {
-			if err = hooks.AfterDumpHook(context.Background()); err != nil {
-				zlogger.Fatal().Msg(err.Error())
-			}
+		if err := chameleon.GetCanal().Dump(); err != nil {
+			zlogger.Panic().Msg(err.Error())
 		}
 	}
 
 	if conf.Source.Sync {
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					zlogger.Info().Msgf("Recovered. Error:\n", r)
+					receiver.Close()
+				}
+			}()
 			if conf.Source.Dump {
-				if err := c.Run(); err != nil {
+				if err := chameleon.GetCanal().Run(); err != nil {
 					panic(err)
 				}
 			} else {
-				pos, err := c.GetMasterPos()
+				pos, err := chameleon.GetCanal().GetMasterPos()
 				if err != nil {
-					zlogger.Fatal().Msg(err.Error())
+					zlogger.Panic().Msg(err.Error())
 				}
-				if err := c.RunFrom(pos); err != nil {
-					panic(err)
+				if err := chameleon.GetCanal().RunFrom(pos); err != nil {
+					zlogger.Panic().Msg(err.Error())
 				}
 			}
 		}()

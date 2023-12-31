@@ -10,6 +10,12 @@ import (
 	"github.com/unionj-cloud/go-doudou/v2/toolkit/errorx"
 )
 
+var G_Config *Config
+
+func init() {
+	G_Config = LoadFromEnv()
+}
+
 type Config struct {
 	Source struct {
 		Addr              string
@@ -21,6 +27,8 @@ type Config struct {
 		Database          string
 		Dump              bool
 		Sync              bool
+		Handler           string
+		DumpBatchSize     int
 	}
 	config.Config
 }

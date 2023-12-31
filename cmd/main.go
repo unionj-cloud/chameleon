@@ -6,6 +6,7 @@ package main
 
 import (
 	_ "github.com/unionj-cloud/chameleon/plugin"
+	"github.com/unionj-cloud/go-doudou/v2/toolkit/zlogger"
 
 	"github.com/unionj-cloud/go-doudou/v2/framework/grpcx"
 	"github.com/unionj-cloud/go-doudou/v2/framework/plugin"
@@ -19,6 +20,9 @@ func main() {
 		v.Initialize(srv, grpcServer, nil)
 	}
 	defer func() {
+		if r := recover(); r != nil {
+			zlogger.Info().Msgf("Recovered. Error:\n", r)
+		}
 		for _, v := range plugin.GetServicePlugins() {
 			v.Close()
 		}
