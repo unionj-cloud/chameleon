@@ -8,10 +8,11 @@ require (
 	github.com/kelseyhightower/envconfig v1.4.0
 	github.com/pingcap/errors v0.11.5-0.20210425183316-da1aaba5fb63
 	github.com/pkg/errors v0.9.1
+	github.com/samber/lo v1.39.0
 	github.com/siddontang/go-log v0.0.0-20190221022429-1e957dd83bed
 	github.com/spf13/cast v1.3.0
 	github.com/stretchr/testify v1.8.4
-	github.com/unionj-cloud/go-doudou/v2 v2.2.3
+	github.com/unionj-cloud/go-doudou/v2 v2.2.4
 	gorm.io/gorm v1.25.5
 )
 
@@ -128,7 +129,6 @@ require (
 	github.com/rogpeppe/go-internal v1.10.0 // indirect
 	github.com/rs/cors v1.9.0 // indirect
 	github.com/rs/zerolog v1.28.0 // indirect
-	github.com/samber/lo v1.39.0 // indirect
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529 // indirect
 	github.com/segmentio/asm v1.2.0 // indirect
 	github.com/shirou/gopsutil v3.21.11+incompatible // indirect
@@ -182,5 +182,3 @@ require (
 	gorm.io/driver/sqlserver v1.4.2 // indirect
 	gorm.io/plugin/prometheus v0.1.0 // indirect
 )
-
-replace github.com/unionj-cloud/go-doudou/v2 v2.2.3 => /Users/wubin1989/workspace/cloud/go-doudou

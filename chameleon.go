@@ -48,7 +48,7 @@ func init() {
 	cfg.Addr = conf.Source.Addr
 	cfg.User = conf.Source.User
 	cfg.Password = conf.Source.Pass
-	cfg.Dump.Databases = []string{conf.Source.Database}
+	cfg.Dump.Databases = conf.Source.Databases
 	cfg.IncludeTableRegex = conf.Source.IncludeTableRegex
 	cfg.ExcludeTableRegex = conf.Source.ExcludeTableRegex
 

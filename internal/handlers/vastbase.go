@@ -9,6 +9,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/pkg/errors"
+	"github.com/samber/lo"
 	"github.com/siddontang/go-log/log"
 	"github.com/unionj-cloud/chameleon"
 	"github.com/unionj-cloud/chameleon/config"
@@ -37,14 +38,16 @@ type DumpTask struct {
 }
 
 type VastbaseEventHandler struct {
-	conf      *config.Config
-	vendor    dbvendor.IVendor
-	targetDB  *gorm.DB
-	sourceDB  *client.Conn
-	regs      []*regexp.Regexp
-	dumping   bool
-	dumpTasks []*DumpTask
-	taskPool  sync.Pool
+	conf            *config.Config
+	vendor          dbvendor.IVendor
+	targetDB        *gorm.DB
+	sourceDB        map[string]*client.Conn
+	regs            []*regexp.Regexp
+	dumping         bool
+	dumpTasks       []*DumpTask
+	taskPool        sync.Pool
+	targetSchemas   []string
+	sourceTargetMap map[string]string
 }
 
 func (h *VastbaseEventHandler) Close() {
@@ -54,16 +57,37 @@ func (h *VastbaseEventHandler) Close() {
 			sqlDB.Close()
 		}
 	}
-	if h.sourceDB != nil {
-		h.sourceDB.Close()
+	if h.sourceDB != nil && len(h.sourceDB) > 0 {
+		for _, v := range h.sourceDB {
+			v.Close()
+		}
 	}
 }
 
 func init() {
 	conf := config.G_Config
-	conn, err := client.Connect(conf.Source.Addr, conf.Source.User, conf.Source.Pass, conf.Source.Database)
-	if err != nil {
-		zlogger.Panic().Msg(err.Error())
+	sourceDB := make(map[string]*client.Conn)
+	var targetSchemas []string
+	sourceTargetMap := make(map[string]string)
+	targetDB := database.NewDb(conf.Config)
+	for _, item := range conf.Source.Databases {
+		conn, err := client.Connect(conf.Source.Addr, conf.Source.User, conf.Source.Pass, item)
+		if err != nil {
+			zlogger.Panic().Msg(err.Error())
+		}
+		sourceDB[item] = conn
+		target := fmt.Sprintf("%s%s", item, conf.Source.TargetDbSuffix)
+		var count int
+		if err = targetDB.WithContext(context.Background()).Raw(`SELECT count(1) FROM information_schema.schemata WHERE schema_name = $1;`, target).Scan(&count).Error; err != nil {
+			zlogger.Panic().Msg(err.Error())
+		}
+		if count == 0 {
+			if err = targetDB.WithContext(context.Background()).Exec(fmt.Sprintf(`CREATE SCHEMA "%s";`, target)).Error; err != nil {
+				zlogger.Panic().Msg(err.Error())
+			}
+		}
+		targetSchemas = append(targetSchemas, target)
+		sourceTargetMap[item] = target
 	}
 	var regs []*regexp.Regexp
 	for _, item := range conf.Source.IncludeTableRegex {
@@ -73,12 +97,11 @@ func init() {
 		}
 		regs = append(regs, reg)
 	}
-	targetDB := database.NewDb(conf.Config)
 	eventHandler := &VastbaseEventHandler{
 		vendor:    dbvendor.Registry.GetVendor(conf.Db.Driver),
 		targetDB:  targetDB,
 		conf:      conf,
-		sourceDB:  conn,
+		sourceDB:  sourceDB,
 		regs:      regs,
 		dumpTasks: make([]*DumpTask, 0, conf.Source.DumpBatchSize),
 		taskPool: sync.Pool{
@@ -86,6 +109,8 @@ func init() {
 				return new(DumpTask)
 			},
 		},
+		targetSchemas:   targetSchemas,
+		sourceTargetMap: sourceTargetMap,
 	}
 	if conf.Source.Dump {
 		eventHandler.dumping = true
@@ -95,7 +120,8 @@ func init() {
 			eventHandler.dumping = false
 
 			if !conf.Source.Sync {
-				if err := eventHandler.targetDB.WithContext(context.Background()).Exec(fmt.Sprintf(`set search_path = "%s";
+				for _, item := range targetSchemas {
+					if err := eventHandler.targetDB.WithContext(context.Background()).Exec(fmt.Sprintf(`set search_path = "%s";
 CREATE OR REPLACE FUNCTION "reset_sequence" (tablename text, columnname text, sequence_name text) 
     RETURNS INTEGER AS 
     
@@ -109,14 +135,15 @@ CREATE OR REPLACE FUNCTION "reset_sequence" (tablename text, columnname text, se
       RETURN retval;
       END;  
     
-    $body$  LANGUAGE 'plpgsql';`, conf.Db.Table.Prefix)).Error; err != nil {
-					zlogger.Panic().Msg(err.Error())
-				}
-				if err := eventHandler.targetDB.WithContext(context.Background()).Exec(`SELECT table_name || '_' || column_name || '_seq', 
+    $body$  LANGUAGE 'plpgsql';`, item)).Error; err != nil {
+						zlogger.Panic().Msg(err.Error())
+					}
+					if err := eventHandler.targetDB.WithContext(context.Background()).Exec(`SELECT table_name || '_' || column_name || '_seq', 
     reset_sequence(table_name, column_name, table_name || '_' || column_name || '_seq') 
 FROM information_schema.columns where columns.table_schema = $1 and columns.column_default like 'nextval%';
-`, conf.Db.Table.Prefix).Error; err != nil {
-					zlogger.Panic().Msg(err.Error())
+`, item).Error; err != nil {
+						zlogger.Panic().Msg(err.Error())
+					}
 				}
 			}
 		}()
@@ -139,6 +166,13 @@ func (h *VastbaseEventHandler) doBatchInsert(db *sql.DB, dml dbvendor.DMLSchema,
 	if err != nil {
 		zlogger.Panic().Err(errors.WithStack(err)).Msg(err.Error())
 	}
+	lo.ForEach(args, func(item interface{}, index int) {
+		if value, ok := item.(string); ok {
+			if value == "0000-00-00 00:00:00" || value == "0000-00-00" {
+				args[index] = nil
+			}
+		}
+	})
 	if _, err = db.ExecContext(context.Background(), statement, args...); err != nil {
 		zlogger.Panic().Err(errors.WithStack(err)).Msg(err.Error())
 	}
@@ -215,32 +249,33 @@ func (h *VastbaseEventHandler) fetchExistTable(conn *client.Conn) ([]string, err
 }
 
 func (h *VastbaseEventHandler) Migrate() error {
-	existTables, err := h.fetchExistTable(h.sourceDB)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	database := h.conf.Source.Database
-	for _, table := range existTables {
-		match := false
-		for _, reg := range h.regs {
-			match = reg.MatchString(fmt.Sprintf("%s.%s", database, table))
-			if match {
-				break
-			}
-		}
-		if len(h.regs) > 0 && !match {
-			continue
-		}
-		sourceTable, err := schema.NewTable(h.sourceDB, database, table)
+	for k, v := range h.sourceDB {
+		existTables, err := h.fetchExistTable(v)
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		var targetTable dbvendor.Table
-		if err = h.ConvertSourceTable2TargetTable(sourceTable, &targetTable); err != nil {
-			return errors.WithStack(err)
-		}
-		if err = h.vendor.CreateTable(context.Background(), h.targetDB, targetTable); err != nil {
-			return errors.WithStack(err)
+		for _, table := range existTables {
+			match := false
+			for _, reg := range h.regs {
+				match = reg.MatchString(fmt.Sprintf("%s.%s", k, table))
+				if match {
+					break
+				}
+			}
+			if len(h.regs) > 0 && !match {
+				continue
+			}
+			sourceTable, err := schema.NewTable(v, k, table)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			var targetTable dbvendor.Table
+			if err = h.ConvertSourceTable2TargetTable(sourceTable, &targetTable); err != nil {
+				return errors.WithStack(err)
+			}
+			if err = h.vendor.CreateTable(context.Background(), h.targetDB, targetTable); err != nil {
+				return errors.WithStack(err)
+			}
 		}
 	}
 	return nil
@@ -248,7 +283,7 @@ func (h *VastbaseEventHandler) Migrate() error {
 
 func (h *VastbaseEventHandler) ConvertSourceTable2TargetTable(source *schema.Table, target *dbvendor.Table) error {
 	target.Name = strings.ToLower(source.Name)
-	target.TablePrefix = h.conf.Db.Table.Prefix
+	target.TablePrefix = h.sourceTargetMap[source.Schema]
 	if len(source.PKColumns) == 0 {
 		return errors.WithStack(errors.Errorf("Source table %s should have at least one primary key", source.Name))
 	}
@@ -448,7 +483,7 @@ func (h *VastbaseEventHandler) OnDDL(header *replication.EventHeader, nextPos my
 			return nil
 		case *parser.AlterTable:
 			tableName := strings.ToLower(table.Name)
-			tablePrefix := h.conf.Db.Table.Prefix
+			tablePrefix := h.sourceTargetMap[string(queryEvent.Schema)]
 			if stringutils.IsEmpty(tablePrefix) {
 				tablePrefix = h.conf.Db.Name
 			}
@@ -536,7 +571,7 @@ func (h *VastbaseEventHandler) OnPosSynced(header *replication.EventHeader, pos 
 func (h *VastbaseEventHandler) OnRow(e *canal.RowsEvent) error {
 	log.Debugf("%s %v\n", e.Action, e.Rows)
 	tableName := e.Table.Name
-	tablePrefix := h.conf.Db.Table.Prefix
+	tablePrefix := h.sourceTargetMap[e.Table.Schema]
 	if stringutils.IsEmpty(tablePrefix) {
 		tablePrefix = h.conf.Db.Name
 	}

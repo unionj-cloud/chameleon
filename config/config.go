@@ -24,11 +24,12 @@ type Config struct {
 		IncludeTableRegex []string
 		ExcludeTableRegex []string
 		Migrate           bool
-		Database          string
+		Databases         []string
 		Dump              bool
 		Sync              bool
 		Handler           string
 		DumpBatchSize     int
+		TargetDbSuffix    string
 	}
 	config.Config
 }
