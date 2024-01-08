@@ -42,7 +42,8 @@ type VastbaseEventHandler struct {
 	vendor          dbvendor.IVendor
 	targetDB        *gorm.DB
 	sourceDB        map[string]*client.Conn
-	regs            []*regexp.Regexp
+	includeRegs     []*regexp.Regexp
+	excludeRegs     []*regexp.Regexp
 	dumping         bool
 	dumpTasks       []*DumpTask
 	taskPool        sync.Pool
@@ -89,21 +90,30 @@ func init() {
 		targetSchemas = append(targetSchemas, target)
 		sourceTargetMap[item] = target
 	}
-	var regs []*regexp.Regexp
+	var includeRegs []*regexp.Regexp
 	for _, item := range conf.Source.IncludeTableRegex {
 		reg, err := regexp.Compile(item)
 		if err != nil {
 			zlogger.Panic().Msg(err.Error())
 		}
-		regs = append(regs, reg)
+		includeRegs = append(includeRegs, reg)
+	}
+	var excludeRegs []*regexp.Regexp
+	for _, item := range conf.Source.ExcludeTableRegex {
+		reg, err := regexp.Compile(item)
+		if err != nil {
+			zlogger.Panic().Msg(err.Error())
+		}
+		excludeRegs = append(excludeRegs, reg)
 	}
 	eventHandler := &VastbaseEventHandler{
-		vendor:    dbvendor.Registry.GetVendor(conf.Db.Driver),
-		targetDB:  targetDB,
-		conf:      conf,
-		sourceDB:  sourceDB,
-		regs:      regs,
-		dumpTasks: make([]*DumpTask, 0, conf.Source.DumpBatchSize),
+		vendor:      dbvendor.Registry.GetVendor(conf.Db.Driver),
+		targetDB:    targetDB,
+		conf:        conf,
+		sourceDB:    sourceDB,
+		includeRegs: includeRegs,
+		excludeRegs: excludeRegs,
+		dumpTasks:   make([]*DumpTask, 0, conf.Source.DumpBatchSize),
 		taskPool: sync.Pool{
 			New: func() any {
 				return new(DumpTask)
@@ -228,7 +238,7 @@ func (h *VastbaseEventHandler) batchInsert() {
 }
 
 func (h *VastbaseEventHandler) fetchExistTable(conn *client.Conn) ([]string, error) {
-	r, err := conn.Execute("show tables")
+	r, err := conn.Execute("show full tables where Table_Type = 'BASE TABLE';")
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -238,10 +248,9 @@ func (h *VastbaseEventHandler) fetchExistTable(conn *client.Conn) ([]string, err
 
 	// Direct access to fields
 	for _, row := range r.Values {
-		for _, val := range row {
-			if val.Type == mysql.FieldValueTypeString {
-				existTables = append(existTables, string(val.AsString()))
-			}
+		val := row[0]
+		if val.Type == mysql.FieldValueTypeString {
+			existTables = append(existTables, string(val.AsString()))
 		}
 	}
 
@@ -255,15 +264,29 @@ func (h *VastbaseEventHandler) Migrate() error {
 			return errors.WithStack(err)
 		}
 		for _, table := range existTables {
-			match := false
-			for _, reg := range h.regs {
-				match = reg.MatchString(fmt.Sprintf("%s.%s", k, table))
-				if match {
-					break
+			if len(h.includeRegs) > 0 {
+				match := false
+				for _, reg := range h.includeRegs {
+					match = reg.MatchString(fmt.Sprintf("%s.%s", k, table))
+					if match {
+						break
+					}
+				}
+				if !match {
+					continue
 				}
 			}
-			if len(h.regs) > 0 && !match {
-				continue
+			if len(h.excludeRegs) > 0 {
+				match := false
+				for _, reg := range h.excludeRegs {
+					match = reg.MatchString(fmt.Sprintf("%s.%s", k, table))
+					if match {
+						break
+					}
+				}
+				if match {
+					continue
+				}
 			}
 			sourceTable, err := schema.NewTable(v, k, table)
 			if err != nil {
@@ -284,13 +307,16 @@ func (h *VastbaseEventHandler) Migrate() error {
 func (h *VastbaseEventHandler) ConvertSourceTable2TargetTable(source *schema.Table, target *dbvendor.Table) error {
 	target.Name = strings.ToLower(source.Name)
 	target.TablePrefix = h.sourceTargetMap[source.Schema]
-	if len(source.PKColumns) == 0 {
-		return errors.WithStack(errors.Errorf("Source table %s should have at least one primary key", source.Name))
+	if len(source.PKColumns) > 0 {
+		for _, col := range source.PKColumns {
+			target.Pk = append(target.Pk, strings.ToLower(source.Columns[col].Name))
+		}
 	}
-	// only support single primary key
-	target.Pk = strings.ToLower(source.Columns[source.PKColumns[0]].Name)
 	for _, item := range source.Columns {
-		isPk := item.Name == target.Pk
+		isPk := false
+		if sliceutils.StringContains(target.Pk, item.Name) {
+			isPk = true
+		}
 		col := dbvendor.Column{
 			TablePrefix: target.TablePrefix,
 			Table:       target.Name,
