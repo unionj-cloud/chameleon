@@ -21,7 +21,7 @@ func main() {
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			zlogger.Info().Msgf("Recovered. Error:\n", r)
+			zlogger.Info().Msgf("Recovered. Error: %s\n", r)
 		}
 		for _, v := range plugin.GetServicePlugins() {
 			v.Close()

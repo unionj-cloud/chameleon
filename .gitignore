@@ -22,3 +22,6 @@
 go.work
 *-local.yml
 .idea
+web
+plugin/rice-box.go
+dist
