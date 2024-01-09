@@ -12,7 +12,7 @@ require (
 	github.com/siddontang/go-log v0.0.0-20190221022429-1e957dd83bed
 	github.com/spf13/cast v1.3.0
 	github.com/stretchr/testify v1.8.4
-	github.com/unionj-cloud/go-doudou/v2 v2.2.5
+	github.com/unionj-cloud/go-doudou/v2 v2.2.6
 	gorm.io/gorm v1.25.5
 )
 

@@ -601,14 +601,18 @@ func (h *VastbaseEventHandler) OnRow(e *canal.RowsEvent) error {
 	if stringutils.IsEmpty(tablePrefix) {
 		tablePrefix = h.conf.Db.Name
 	}
-	pkCol := e.Table.GetPKColumn(0)
+	var pk []dbvendor.Column
+	for i := range e.Table.PKColumns {
+		pkCol := e.Table.GetPKColumn(i)
+		pk = append(pk, dbvendor.Column{
+			Name: pkCol.Name,
+		})
+	}
 	dml := dbvendor.DMLSchema{
 		Schema:      h.conf.Db.Name,
 		TablePrefix: tablePrefix,
 		TableName:   tableName,
-		Pk: dbvendor.Column{
-			Name: pkCol.Name,
-		},
+		Pk:          pk,
 	}
 	switch e.Action {
 	case canal.InsertAction:
@@ -675,7 +679,7 @@ func (h *VastbaseEventHandler) OnRow(e *canal.RowsEvent) error {
 		if len(pkVals) == 0 {
 			return nil
 		}
-		row = append(row, pkVals[0])
+		row = append(row, pkVals...)
 		if _, err = sqlDB.ExecContext(context.Background(), statement, row...); err != nil {
 			zlogger.Err(errors.WithStack(err)).Msg(err.Error())
 			return nil
@@ -689,7 +693,7 @@ func (h *VastbaseEventHandler) OnRow(e *canal.RowsEvent) error {
 		if len(pkVals) == 0 {
 			return nil
 		}
-		if err = h.vendor.Delete(context.Background(), h.targetDB, dml, pkVals[0]); err != nil {
+		if err = h.vendor.Delete(context.Background(), h.targetDB, dml, pkVals...); err != nil {
 			zlogger.Err(errors.WithStack(err)).Msg(err.Error())
 			return nil
 		}
